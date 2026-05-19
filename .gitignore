@@ -1,0 +1,26 @@
+# 학습 산출물
+data/
+checkpoints/
+ds-rank-logs/
+.hf/
+
+# Run 설정 (HF token 등 시크릿)
+yaml/
+
+# 백업 (sed -i.bak)
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# OpenRLHF가 생성하는 임시
+*.egg-info/
+build/
+dist/
