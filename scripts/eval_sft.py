@@ -70,7 +70,16 @@ def main() -> None:
     sampling = SamplingParams(temperature=0.0, max_tokens=768)
 
     prompts = [build_prompt(q) for q, _ in examples]
+    print(f"Starting generation on {len(prompts)} prompts ...", flush=True)
     outputs = llm.generate(prompts, sampling)
+    print(f"Generation complete. Got {len(outputs)} outputs.", flush=True)
+
+    # Save raw outputs first (before parsing) in case parsing crashes
+    raw_path = f"/workspace/outputs/{os.environ.get('VESSL_RUN_NAME', 'eval-sft')}-raw.json"
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    with open(raw_path, "w") as f:
+        json.dump([{"q": q, "gold": g, "text": o.outputs[0].text} for (q, g), o in zip(examples, outputs)], f, indent=2)
+    print(f"Saved raw outputs to {raw_path}", flush=True)
 
     correct = 0
     details = []
@@ -90,7 +99,7 @@ def main() -> None:
         print(f"Q: {q[:80]}...")
         print(f"  pred={pred_n}  gold={gold}  ok={ok}")
         print(f"  raw[:200]: {text[:200]}")
-        print("---")
+        print("---", flush=True)
 
     acc = correct / len(examples)
     print(f"\n========== SFT_ACC: {acc:.4f} ==========", flush=True)
@@ -99,7 +108,9 @@ def main() -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump({"sft_acc": acc, "n": len(examples), "details": details}, f, indent=2)
-    print(f"Saved details to {out_path}")
+    print(f"Saved details to {out_path}", flush=True)
+    # small sleep so container doesn't kill log stream before flush
+    import time; time.sleep(5)
 
 
 if __name__ == "__main__":
