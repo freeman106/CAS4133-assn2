@@ -48,10 +48,15 @@ def extract_final(text: str):
 
 
 def main() -> None:
-    sft_repo = os.environ["HF_SFT_REPO_ID"]
-    local_dir = "/tmp/sft_model"
-    print(f"Downloading {sft_repo} ...", flush=True)
-    snapshot_download(repo_id=sft_repo, local_dir=local_dir, repo_type="model")
+    # Prefer local path if set, else download from HF Hub
+    local_dir = os.environ.get("ASSN2_LOCAL_SFT_DIR")
+    if local_dir and os.path.isdir(local_dir):
+        print(f"Using local SFT model at {local_dir}", flush=True)
+    else:
+        sft_repo = os.environ["HF_SFT_REPO_ID"]
+        local_dir = "/tmp/sft_model"
+        print(f"Downloading {sft_repo} ...", flush=True)
+        snapshot_download(repo_id=sft_repo, local_dir=local_dir, repo_type="model")
 
     ds = load_dataset("talzoomanzoo/gsm8k", split="test").shuffle(seed=42).select(range(100))
     examples = [(ex["Question"], norm(ex["answer"])) for ex in ds]
