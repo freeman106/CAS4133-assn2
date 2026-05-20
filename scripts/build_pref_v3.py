@@ -3,31 +3,41 @@
 chosen   = Qwen2.5-Math-7B-Instruct (~90% GSM8K) correct rollouts
 rejected = base Llama-3.2-1B-Instruct (~20-48% GSM8K) wrong rollouts
 
-Two-phase vLLM generation (one model loaded at a time to fit single 24GB GPU):
-  phase 1: Qwen-Math-7B → keep correct outputs → chosen pool per problem
-  phase 2: Llama-1B base → keep wrong outputs → rejected pool per problem
-  pair: longest correct chosen × shortest wrong rejected, length-delta filter
+vLLM 0.19.1 cannot reliably load two models in one process (distributed state
+leaks across models). So we split into two phases run as SEPARATE Python
+invocations from the yaml; each phase gets a clean CUDA/distributed state.
 
-Output:
-  data/assn2_pref_dpo.jsonl  (also uploads to HF dataset HF_PREF_REPO_ID)
+Phases:
+  --phase 1   Qwen-Math-7B → keep correct outputs → save to PHASE1_OUT
+  --phase 2   Llama-1B base → keep wrong outputs → pair with phase 1 → save + upload
 
-Env vars:
+Outputs:
+  data/assn2_pref_dpo.jsonl       (DPO/SimPO training)
+  data/assn2_pref_labels.jsonl    (label data, optional)
+  HF Hub dataset HF_PREF_REPO_ID  (assn2_pref.jsonl in repo)
+
+Env vars (same defaults across phases):
   HF_TOKEN, HF_PREF_REPO_ID
-  ASSN2_PREF_MAX_SEED          (default 2000)
-  ASSN2_PREF_QWEN_SAMPLES      (default 2)
-  ASSN2_PREF_BASE_SAMPLES      (default 5)
-  ASSN2_PREF_MIN_LEN           (default 80)
-  ASSN2_PREF_MAX_LEN           (default 2400)
-  ASSN2_PREF_LEN_DELTA_MAX     (default 400)
+  ASSN2_QWEN_MODEL, ASSN2_BASE_MODEL
+  ASSN2_PREF_MAX_SEED              (default 2000)
+  ASSN2_PREF_QWEN_SAMPLES          (default 2)
+  ASSN2_PREF_BASE_SAMPLES          (default 5)
+  ASSN2_PREF_TEMP                  (default 0.8)
+  ASSN2_PREF_MAX_NEW               (default 768)
+  ASSN2_PREF_MIN_LEN               (default 80)
+  ASSN2_PREF_MAX_LEN               (default 2400)
+  ASSN2_PREF_LEN_DELTA_MAX         (default 400)
   ASSN2_PREF_MAX_PAIRS_PER_PROBLEM (default 2)
-  ASSN2_MAX_DPO_PAIRS          (default 1000)
+  ASSN2_MAX_DPO_PAIRS              (default 1000)
 """
 
+import argparse
 import gc
 import json
 import os
 import re
 import statistics
+import sys
 from pathlib import Path
 
 import torch
@@ -36,7 +46,7 @@ from huggingface_hub import HfApi, create_repo
 from vllm import LLM, SamplingParams
 
 
-# ===== Config =====
+# ===== Config (read once; identical across phases) =====
 QWEN_MODEL = os.environ.get("ASSN2_QWEN_MODEL", "Qwen/Qwen2.5-Math-7B-Instruct")
 BASE_MODEL = os.environ.get("ASSN2_BASE_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
 
@@ -61,8 +71,11 @@ DATA_DIR = Path(os.environ.get("ASSN2_DATA_DIR", "/workspace/code/data"))
 OUT_JSONL = DATA_DIR / "assn2_pref_dpo.jsonl"
 LABELS_JSONL = DATA_DIR / "assn2_pref_labels.jsonl"
 
+# Phase 1 intermediate output (chosen pool)
+PHASE1_OUT = Path(os.environ.get("ASSN2_PHASE1_OUT", "/workspace/code/data/_pref_v3_chosen.json"))
 
-# ===== Reasoning helpers (mirror openrlhf/assn2/reasoning) =====
+
+# ===== Reasoning helpers =====
 def build_prompt(q: str) -> str:
     return (
         "You are a careful reasoner. Solve step-by-step. "
@@ -85,8 +98,7 @@ def norm_answer(x):
 
 
 def extract_final(text: str):
-    """Extract final answer, supporting both '#### N' and '\\boxed{N}' formats."""
-    # Prefer #### (matches our prompt template), fallback to \boxed (Qwen-Math style)
+    """Extract final answer; supports both '#### N' and '\\boxed{N}' formats."""
     last_hash = None
     for m in _HASH_RE.finditer(text):
         last_hash = m
@@ -101,40 +113,13 @@ def extract_final(text: str):
 
 
 def ensure_hash_format(text: str, gold: str) -> str:
-    """Append '#### N' to text if not present, using extracted answer."""
+    """Append '#### N' to text if not already there (so training sees consistent suffix)."""
     if _HASH_RE.search(text):
         return text
     pred = extract_final(text)
     if pred is None:
         return text
-    norm = norm_answer(pred)
-    return text.rstrip() + f"\n\n#### {norm}"
-
-
-def cleanup_vllm():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    try:
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            dist.destroy_process_group()
-    except Exception:
-        pass
-    try:
-        import vllm.distributed.parallel_state as ps
-
-        ps.destroy_model_parallel()
-        if getattr(ps, "_WORLD", None) is not None:
-            try:
-                ps._WORLD.destroy()
-            except Exception:
-                pass
-            ps._WORLD = None
-    except Exception:
-        pass
+    return text.rstrip() + f"\n\n#### {norm_answer(pred)}"
 
 
 def load_vllm(model_id: str) -> LLM:
@@ -162,9 +147,7 @@ def generate(llm: LLM, prompts, n_samples: int):
     return outs
 
 
-def main() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
+def load_seed_problems():
     print(f"Loading GSM8K train, MAX_SEED={MAX_SEED} ...", flush=True)
     ds = load_dataset("talzoomanzoo/gsm8k", split="train")
     ds = ds.shuffle(seed=42).select(range(min(MAX_SEED, len(ds))))
@@ -173,18 +156,21 @@ def main() -> None:
     golds = [norm_answer(r["answer"]) for r in rows]
     prompts = [build_prompt(q) for q in questions]
     print(f"Seeded {len(rows)} problems", flush=True)
+    return questions, golds, prompts
 
-    # ===== Phase 1: Qwen-Math-7B for chosen =====
-    print(f"\n[Phase 1] Loading {QWEN_MODEL} for chosen generation ({NUM_QWEN_SAMPLES} samples/problem) ...", flush=True)
+
+# ===== Phase 1: Qwen-Math-7B → chosen =====
+def phase1() -> None:
+    questions, golds, prompts = load_seed_problems()
+
+    print(f"\n[Phase 1] Loading {QWEN_MODEL} ({NUM_QWEN_SAMPLES} samples/problem) ...", flush=True)
     llm = load_vllm(QWEN_MODEL)
     qwen_outs = generate(llm, prompts, NUM_QWEN_SAMPLES)
-    del llm
-    cleanup_vllm()
-    print(f"[Phase 1] done.", flush=True)
+    print(f"[Phase 1] generation done.", flush=True)
 
     positives_per_problem = []
     qwen_correct_count = 0
-    for idx, (gold, out) in enumerate(zip(golds, qwen_outs)):
+    for gold, out in zip(golds, qwen_outs):
         comps = [o.text for o in out.outputs]
         pos = []
         for c in comps:
@@ -194,16 +180,39 @@ def main() -> None:
         if pos:
             qwen_correct_count += 1
         positives_per_problem.append(pos)
-    print(f"[Phase 1] Qwen got correct on {qwen_correct_count}/{len(rows)} problems "
-          f"({100*qwen_correct_count/len(rows):.1f}%)", flush=True)
 
-    # ===== Phase 2: Llama-1B base for rejected =====
-    print(f"\n[Phase 2] Loading {BASE_MODEL} for rejected generation ({NUM_BASE_SAMPLES} samples/problem) ...", flush=True)
+    pct = 100 * qwen_correct_count / max(1, len(golds))
+    print(f"[Phase 1] Qwen correct on {qwen_correct_count}/{len(golds)} problems ({pct:.1f}%)", flush=True)
+
+    PHASE1_OUT.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "questions": questions,
+        "golds": golds,
+        "prompts": prompts,
+        "positives_per_problem": positives_per_problem,
+        "qwen_correct_count": qwen_correct_count,
+    }
+    PHASE1_OUT.write_text(json.dumps(payload, ensure_ascii=False))
+    print(f"[Phase 1] saved {PHASE1_OUT} ({PHASE1_OUT.stat().st_size/1e6:.1f} MB)", flush=True)
+
+
+# ===== Phase 2: Llama-1B → rejected, then pair =====
+def phase2() -> None:
+    if not PHASE1_OUT.is_file():
+        raise FileNotFoundError(f"Phase 1 output missing: {PHASE1_OUT}; run --phase 1 first")
+    print(f"\n[Phase 2] Loading phase 1 payload from {PHASE1_OUT} ...", flush=True)
+    payload = json.loads(PHASE1_OUT.read_text())
+    questions = payload["questions"]
+    golds = payload["golds"]
+    prompts = payload["prompts"]
+    positives_per_problem = payload["positives_per_problem"]
+    qwen_correct_count = payload.get("qwen_correct_count", 0)
+    print(f"[Phase 2] loaded {len(prompts)} problems; Qwen correct={qwen_correct_count}", flush=True)
+
+    print(f"\n[Phase 2] Loading {BASE_MODEL} ({NUM_BASE_SAMPLES} samples/problem) ...", flush=True)
     llm = load_vllm(BASE_MODEL)
     base_outs = generate(llm, prompts, NUM_BASE_SAMPLES)
-    del llm
-    cleanup_vllm()
-    print(f"[Phase 2] done.", flush=True)
+    print(f"[Phase 2] generation done.", flush=True)
 
     negatives_per_problem = []
     base_wrong_count = 0
@@ -217,10 +226,10 @@ def main() -> None:
         if neg:
             base_wrong_count += 1
         negatives_per_problem.append(neg)
-    print(f"[Phase 2] Base got wrong on {base_wrong_count}/{len(rows)} problems "
-          f"({100*base_wrong_count/len(rows):.1f}%)", flush=True)
+    print(f"[Phase 2] Base wrong on {base_wrong_count}/{len(golds)} problems "
+          f"({100*base_wrong_count/max(1,len(golds)):.1f}%)", flush=True)
 
-    # ===== Pair them =====
+    # ===== Pair =====
     pairs = []
     label_rows = []
     stat_skip_no_pos = 0
@@ -243,10 +252,9 @@ def main() -> None:
             stat_skip_length += 1
             continue
 
-        pos.sort(key=len, reverse=True)  # longest correct chosen
-        neg.sort(key=len)  # shortest wrong rejected
+        pos.sort(key=len, reverse=True)
+        neg.sort(key=len)
 
-        # record labels (everything that survived filter)
         for p in pos:
             label_rows.append({"prompt": prompt, "response": p, "label": True, "answer": gold})
         for n in neg:
@@ -275,9 +283,9 @@ def main() -> None:
 
     # ===== Stats =====
     print("\n=== Preference v3 (weak-strong) stats ===", flush=True)
-    print(f"  Problems seen:                 {len(rows)}")
-    print(f"  Qwen-Math correct (chosen pool): {qwen_correct_count}")
-    print(f"  Base wrong (rejected pool):      {base_wrong_count}")
+    print(f"  Problems seen:                 {len(prompts)}")
+    print(f"  Qwen correct (chosen pool):    {qwen_correct_count}")
+    print(f"  Base wrong  (rejected pool):   {base_wrong_count}")
     print(f"  Skipped (no chosen):           {stat_skip_no_pos}")
     print(f"  Skipped (no rejected):         {stat_skip_no_neg}")
     print(f"  Skipped (length window):       {stat_skip_length}")
@@ -286,17 +294,17 @@ def main() -> None:
     print(f"  DPO pairs kept:                {len(pairs)}")
     print(f"  Label rows kept:               {len(label_rows)}")
     if pairs:
-        chos_lens = [len(p["chosen"]) for p in pairs]
-        rej_lens = [len(p["rejected"]) for p in pairs]
-        deltas = [c - r for c, r in zip(chos_lens, rej_lens)]
-        print(f"  chosen   chars  mean={statistics.mean(chos_lens):.0f}  median={statistics.median(chos_lens):.0f}")
-        print(f"  rejected chars  mean={statistics.mean(rej_lens):.0f}  median={statistics.median(rej_lens):.0f}")
+        chos = [len(p["chosen"]) for p in pairs]
+        rej = [len(p["rejected"]) for p in pairs]
+        deltas = [c - r for c, r in zip(chos, rej)]
+        print(f"  chosen   chars  mean={statistics.mean(chos):.0f}  median={statistics.median(chos):.0f}")
+        print(f"  rejected chars  mean={statistics.mean(rej):.0f}  median={statistics.median(rej):.0f}")
         print(f"  delta(chosen-rejected) chars  mean={statistics.mean(deltas):+.0f}  median={statistics.median(deltas):+.0f}")
-        n_chosen_shorter = sum(1 for d in deltas if d < 0)
-        print(f"  pairs where chosen is shorter: {n_chosen_shorter}/{len(deltas)} "
-              f"({100*n_chosen_shorter/len(deltas):.1f}%)")
+        nshort = sum(1 for d in deltas if d < 0)
+        print(f"  pairs where chosen is shorter: {nshort}/{len(deltas)} ({100*nshort/len(deltas):.1f}%)")
 
     # ===== Save local =====
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     print(f"\nSaving DPO pairs ({len(pairs)}) -> {OUT_JSONL}", flush=True)
     with OUT_JSONL.open("w", encoding="utf-8") as f:
         for r in pairs:
@@ -306,7 +314,7 @@ def main() -> None:
         for r in label_rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    # ===== Upload to HF Hub =====
+    # ===== HF upload =====
     pref_repo = os.environ.get("HF_PREF_REPO_ID")
     if pref_repo:
         print(f"\nUploading to HF dataset {pref_repo} ...", flush=True)
@@ -316,11 +324,21 @@ def main() -> None:
             path_in_repo="assn2_pref.jsonl",
             repo_id=pref_repo,
             repo_type="dataset",
-            commit_message="Add weak-strong preference data (Qwen-Math chosen, Llama-1B rejected)",
+            commit_message="Add weak-strong pref data (Qwen-Math chosen, Llama-1B rejected)",
         )
         print(f"Uploaded -> https://huggingface.co/datasets/{pref_repo}", flush=True)
     else:
         print("HF_PREF_REPO_ID not set — skip upload.", flush=True)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--phase", type=int, choices=[1, 2], required=True)
+    args = ap.parse_args()
+    if args.phase == 1:
+        phase1()
+    else:
+        phase2()
 
 
 if __name__ == "__main__":
