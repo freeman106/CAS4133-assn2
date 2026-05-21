@@ -1,119 +1,111 @@
-"""Merge LoRA adapter from DPO/SimPO training into base SFT model and save
-to the Vessl-storage-exported outputs directory (no HF Hub upload).
+"""Export DPO/SimPO training output + merged model to vessl-storage.
 
-This is a workaround for the HF Hub upload_folder() hangs we observed.
-The merged model is exported to /workspace/outputs/${VESSL_RUN_NAME}/merged-model
-which Vessl pushes to vessl-storage at Run end. User can then download from
-Vessl Volume and manually upload to HF Hub if needed.
+Strategy: list everything under /workspace/code/checkpoints, copy it to
+/workspace/outputs/{run_name}/checkpoints/ via `cp -r`, then ALSO attempt
+LoRA merge if an adapter is found. If merge fails or no adapter found,
+the raw checkpoint dump is enough for the user to download and inspect.
 
-Looks for adapter in (in order):
-  /workspace/code/checkpoints/assn2-dpo
-  /workspace/code/checkpoints/assn2-simpo
-Loads base from:
-  /workspace/code/checkpoints/assn2-sft-merged-hf
-Saves merged to:
-  /workspace/outputs/${VESSL_RUN_NAME}/merged-model/
+The previous version (a) only looked for `adapter_config.json` at depth-2 and
+missed cases where OpenRLHF saved the merged HF model directly, (b) used
+`shutil.copy2` which crashes on directories like `.cache/`. This version
+uses `subprocess` + `cp -r` for raw dump and only attempts merge when both
+an adapter dir and a base dir are clearly identified.
 """
 
 import gc
-import json
 import os
-import shutil
+import subprocess
+import sys
 from pathlib import Path
 
-import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+CKPT_ROOT = Path("/workspace/code/checkpoints")
+RUN_NAME = os.environ.get("VESSL_RUN_NAME", "merged")
+OUT_ROOT = Path(f"/workspace/outputs/{RUN_NAME}")
+OUT_CKPT = OUT_ROOT / "checkpoints-raw"
+OUT_MERGED = OUT_ROOT / "merged-model"
 
 
-def find_adapter_dir() -> Path | None:
-    """Find newest checkpoint directory with adapter_config.json."""
-    ckpt_root = Path("/workspace/code/checkpoints")
-    if not ckpt_root.is_dir():
-        print(f"[merge_to_volume] no {ckpt_root}")
-        return None
-
-    candidates = []
-    for sub in ["assn2-dpo", "assn2-simpo"]:
-        root = ckpt_root / sub
-        if not root.is_dir():
-            continue
-        # walk for adapter_config.json
-        for p in [root] + list(root.rglob("*")):
-            if not p.is_dir():
-                continue
-            if (p / "adapter_config.json").exists() and (p / "config.json").exists():
-                candidates.append(p)
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
+def run(cmd: list[str]) -> int:
+    print(f"+ {' '.join(cmd)}", flush=True)
+    return subprocess.call(cmd)
 
 
 def main() -> None:
-    base_dir = Path("/workspace/code/checkpoints/assn2-sft-merged-hf")
-    if not base_dir.is_dir():
-        print(f"[merge_to_volume] base SFT model missing: {base_dir} — skip.")
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    if not CKPT_ROOT.is_dir():
+        print(f"[merge] no {CKPT_ROOT} — nothing to do", flush=True)
         return
 
-    adapter_dir = find_adapter_dir()
-    if adapter_dir is None:
-        print("[merge_to_volume] no adapter found — copying base dir instead.")
-        run_name = os.environ.get("VESSL_RUN_NAME", "merged")
-        out_dir = Path(f"/workspace/outputs/{run_name}/merged-model")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for f in base_dir.iterdir():
-            shutil.copy2(f, out_dir / f.name)
-        print(f"[merge_to_volume] copied base -> {out_dir}")
+    print(f"[merge] inventory of {CKPT_ROOT}:", flush=True)
+    run(["ls", "-laR", str(CKPT_ROOT)])
+
+    print(f"\n[merge] copying raw checkpoint tree -> {OUT_CKPT}", flush=True)
+    OUT_CKPT.mkdir(parents=True, exist_ok=True)
+    rc = run(["cp", "-r", f"{CKPT_ROOT}/.", str(OUT_CKPT)])
+    if rc != 0:
+        print(f"[merge] cp -r returned {rc} (continuing)", flush=True)
+    run(["du", "-sh", str(OUT_CKPT)])
+
+    # Try to find adapter for explicit merge
+    base_dir = CKPT_ROOT / "assn2-sft-merged-hf"
+    adapter_dir = None
+    for sub in ["assn2-dpo", "assn2-simpo"]:
+        root = CKPT_ROOT / sub
+        if not root.is_dir():
+            continue
+        # find any subdir (or itself) containing adapter_config.json
+        for p in [root] + sorted(root.rglob("*"), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
+            if p.is_dir() and (p / "adapter_config.json").exists():
+                adapter_dir = p
+                break
+        if adapter_dir is not None:
+            break
+
+    if adapter_dir is None or not base_dir.is_dir():
+        print(f"[merge] no adapter found OR base missing — raw checkpoint dump only.", flush=True)
+        print(f"        adapter_dir={adapter_dir}", flush=True)
+        print(f"        base_dir={base_dir}", flush=True)
         return
 
-    print(f"[merge_to_volume] adapter: {adapter_dir}")
-    print(f"[merge_to_volume] base:    {base_dir}")
+    print(f"\n[merge] attempting merge:", flush=True)
+    print(f"  adapter: {adapter_dir}", flush=True)
+    print(f"  base:    {base_dir}", flush=True)
 
-    # Save adapter dir as-is (small, ~50MB) alongside merged version
-    run_name = os.environ.get("VESSL_RUN_NAME", "merged")
-    out_root = Path(f"/workspace/outputs/{run_name}")
-    out_root.mkdir(parents=True, exist_ok=True)
+    try:
+        import torch
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except Exception as e:
+        print(f"[merge] import failed: {e} — raw dump only.", flush=True)
+        return
 
-    adapter_copy = out_root / "adapter"
-    adapter_copy.mkdir(parents=True, exist_ok=True)
-    for f in adapter_dir.iterdir():
-        if f.is_file():
-            shutil.copy2(f, adapter_copy / f.name)
-    print(f"[merge_to_volume] adapter copied -> {adapter_copy}")
+    try:
+        tok_src = str(adapter_dir if (adapter_dir / "tokenizer_config.json").exists() else base_dir)
+        tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
 
-    # Load + merge
-    print("[merge_to_volume] loading base + adapter for merge ...", flush=True)
-    tok_src = str(adapter_dir if (adapter_dir / "tokenizer_config.json").exists() else base_dir)
-    tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
+        base = AutoModelForCausalLM.from_pretrained(
+            str(base_dir),
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            device_map="auto" if torch.cuda.is_available() else {"": "cpu"},
+        )
+        merged = PeftModel.from_pretrained(base, str(adapter_dir)).merge_and_unload()
 
-    base = AutoModelForCausalLM.from_pretrained(
-        str(base_dir),
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        device_map="auto" if torch.cuda.is_available() else {"": "cpu"},
-    )
-    merged = PeftModel.from_pretrained(base, str(adapter_dir)).merge_and_unload()
-    print("[merge_to_volume] merge_and_unload done.", flush=True)
+        OUT_MERGED.mkdir(parents=True, exist_ok=True)
+        merged.save_pretrained(OUT_MERGED, safe_serialization=True)
+        tokenizer.save_pretrained(OUT_MERGED)
+        print(f"[merge] merged model saved -> {OUT_MERGED}", flush=True)
+        run(["du", "-sh", str(OUT_MERGED)])
 
-    merged_out = out_root / "merged-model"
-    merged_out.mkdir(parents=True, exist_ok=True)
-    merged.save_pretrained(merged_out, safe_serialization=True)
-    tokenizer.save_pretrained(merged_out)
-    print(f"[merge_to_volume] merged model saved -> {merged_out}", flush=True)
-
-    # report sizes
-    total = 0
-    for p in merged_out.rglob("*"):
-        if p.is_file():
-            total += p.stat().st_size
-    print(f"[merge_to_volume] merged size: {total/1e9:.2f} GB")
-
-    del merged, base
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        del merged, base
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"[merge] merge failed: {type(e).__name__}: {e}", flush=True)
+        print(f"        raw checkpoint dump in {OUT_CKPT} is still available.", flush=True)
 
 
 if __name__ == "__main__":
